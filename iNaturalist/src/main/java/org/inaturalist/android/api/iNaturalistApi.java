@@ -27,6 +27,7 @@ import java.util.Calendar;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import okhttp3.Call;
@@ -142,7 +143,6 @@ public class iNaturalistApi {
             = MediaType.parse("application/octet-stream");
 
     /**
-     *
      * @param url what we're doing
      * @param method get, post, put, or delete
      * @param params If non-null, we will send this as the request body with a multipart/form
@@ -150,26 +150,28 @@ public class iNaturalistApi {
      * @param authenticated
      * @param useJWTToken
      * @param allowAnonymousJWTToken
-     * @param cb optional OkHttp3 callback. If null is provided, the call will be run synchronously.
-     *           If you want an async call you must provide a callback (for now)
+     * @param cb OkHttp3 callback. The call will be run asynchronously, you must provide a callback
      * @return null if a callback was passed. Otherwise, this method will either return a response or
      *          throw an exception
      * @throws IOException Problem with network (read/write request body, connect to server, etc)
      * @throws ApiError Our code caught some error that's not a network-caused issue. See subclass descriptions
      */
     @Nullable
-    private ApiResponse okHttpRequest(@NonNull String url, @NonNull String method,
+    private void okHttpRequest(@NonNull String url, @NonNull String method,
                                       @Nullable ArrayList<NameValuePair> params,
                                       @Nullable JSONObject jsonContent, boolean authenticated, boolean useJWTToken,
-                                      boolean allowAnonymousJWTToken, @Nullable ApiCallback<JSONArray> cb)
+                                      boolean allowAnonymousJWTToken, @NonNull ApiCallback<JSONArray> cb)
             throws IOException, ApiError {
+
+        if (cb == null)
+            throw new IllegalArgumentException("Callback cannot be null");
 
         // TODO handle POST redirects (301,302,307,308)
         // We would need to check the location (same domain) and protocol (still HTTPS) to be secure
         // Why is this needed anyways? The server should not be doing this...
         // TODO disable content compression for "Faster reading of data"
         //   .disableContentCompression()
-        Request.Builder request = new Request.Builder()
+        Request.Builder requestBuilder = new Request.Builder()
                 .url(url)
                 .header("User-Agent", mHelper.getUserAgent());
 
@@ -182,7 +184,7 @@ public class iNaturalistApi {
         // Building the request body
         RequestBody body = null;
         if (jsonContent != null) {
-            request.header("Content-type", "application/json");
+            requestBuilder.header("Content-type", "application/json");
             body = RequestBody.create(JSON, jsonContent.toString());
         } else if (params != null) {
             // "Standard" multipart encoding
@@ -209,7 +211,7 @@ public class iNaturalistApi {
                         multipartBody.addFormDataPart(paramName, paramValue,
                                 RequestBody.create(customAudio, new File(paramValue)));
                         // TODO should we not have this on all requests? It's the only thing we parse if 200 is returned
-                        request.header("Accept", "application/json");
+                        requestBuilder.header("Accept", "application/json");
                     } else {
                         multipartBody.addFormDataPart(paramName, paramValue,
                                 RequestBody.create(OCTET, new File(paramValue)));
@@ -228,13 +230,13 @@ public class iNaturalistApi {
         }
 
         if (method.equalsIgnoreCase("post")) {
-            request.post(body);
+            requestBuilder.post(body);
         } else if (method.equalsIgnoreCase("delete")) {
-            request.delete(body);
+            requestBuilder.delete(body);
         } else if (method.equalsIgnoreCase("put")) {
-            request.put(body);
+            requestBuilder.put(body);
         } else {
-            request.get();
+            requestBuilder.get();
         }
 
         if (url.startsWith(API_HOST) && (mHelper.credentials() != null)) {
@@ -246,39 +248,27 @@ public class iNaturalistApi {
         if (authenticated) {
             if (useJWTToken && allowAnonymousJWTToken && (mHelper.credentials() == null)) {
                 // User not logged in, but allow using anonymous JWT
-                request.addHeader("Authorization", mHelper.getAnonymousJWTToken());
+                requestBuilder.addHeader("Authorization", mHelper.getAnonymousJWTToken());
             } else {
                 mHelper.ensureCredentials();
 
                 if (useJWTToken) {
                     // Use JSON Web Token for this request
-                    request.addHeader("Authorization", mHelper.getJWTToken());
+                    requestBuilder.addHeader("Authorization", mHelper.getJWTToken());
                 } else if (mHelper.getLoginType() == INaturalistService.LoginType.PASSWORD) {
                     // Old-style password authentication
-                    request.addHeader("Authorization", "Basic " + mHelper.credentials());
+                    requestBuilder.addHeader("Authorization", "Basic " + mHelper.credentials());
                 } else {
                     // OAuth2 token (Facebook/G+/etc)
-                    request.addHeader("Authorization", "Bearer " + mHelper.credentials());
+                    requestBuilder.addHeader("Authorization", "Bearer " + mHelper.credentials());
                 }
             }
         }
 
-        return runRequest(request, cb);
-    }
-
-    @Nullable
-    private ApiResponse runRequest(Request.Builder requestBuilder, @Nullable ApiCallback<JSONArray> cb) throws ApiError, IOException {
-
         Request request = requestBuilder.build();
         Call call = mClient.newCall(request);
 
-        if (cb == null) {
-            Response response = call.execute();
-            return decodeOrThrow(response);
-        }
-
-        // They passed async callback, so check if we are running in testing mode
-        CallbackAdapter scb = new CallbackAdapter(cb);
+        CallbackDecodingAdapter scb = new CallbackDecodingAdapter(cb);
         if (SYNC_FOR_TESTING) {
             // Emulate the normal async operation of callbacks, but use the current thread
             try {
@@ -290,20 +280,18 @@ public class iNaturalistApi {
         } else {
             call.enqueue(scb);
         }
-
-        return null;
     }
 
     /**
-     * OkHttp does not decode contents before returning. We want to, b/c it's awesome. This class
-     * bridges the OkHttp Callback into decoding contents and calling our own ApiCallback with
-     * decoded JSON
+     * OkHttp does not decode contents before returning. We want to, b/c this is awesome. This
+     * helper class bridges the OkHttp Callback into decoding contents and calling our own
+     * ApiCallback with decoded JSON
      */
-    private class CallbackAdapter implements Callback {
+    private class CallbackDecodingAdapter implements Callback {
 
         private final ApiCallback<JSONArray> mUserCallback;
 
-        CallbackAdapter(ApiCallback<JSONArray> userCallback) {
+        CallbackDecodingAdapter(ApiCallback<JSONArray> userCallback) {
             mUserCallback = userCallback;
         }
 
@@ -577,9 +565,41 @@ public class iNaturalistApi {
     public ApiResponse syncRequest(String url, String method, ArrayList<NameValuePair> params,
                                    JSONObject jsonContent, boolean authenticated, boolean useJWTToken,
                                    boolean allowAnonymousJWTToken) throws IOException, ApiError {
-        return okHttpRequest(url, method, params, jsonContent, authenticated, useJWTToken,
-                allowAnonymousJWTToken, null);
+
+        SynchronizeCallback sb = new SynchronizeCallback();
+        asyncRequest(url, method, params, jsonContent, authenticated, useJWTToken,
+                allowAnonymousJWTToken, sb);
+        try {
+            sb.countDownLatch.await();
+        } catch (InterruptedException e) {
+            ApiError ae = new ApiError("Synchronous call interrupted");
+            ae.initCause(e);
+            throw ae;
+        }
+        if (sb.error != null)
+            throw sb.error;
+        return sb.response;
     }
+
+    static class SynchronizeCallback implements ApiCallback<JSONArray> {
+        ApiError error = null;
+        ApiResponse response = null;
+        CountDownLatch countDownLatch = new CountDownLatch(1);
+
+        @Override
+        public void onApiError(Call call, ApiError e) {
+            error = e;
+            countDownLatch.countDown();
+        }
+
+        @Override
+        public void onResponse(Call call, JSONArray json) {
+            response = new ApiResponse();
+            response.parsedResponse = json;
+            response.httpResponseCode = 200;
+            countDownLatch.countDown();
+        }
+    };
 
     private void putAsync(String url, JSONObject jsonContent, ArrayList<NameValuePair> params,
                           ApiCallback<JSONArray> cb) {

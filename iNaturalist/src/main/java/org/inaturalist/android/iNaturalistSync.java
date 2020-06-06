@@ -142,8 +142,6 @@ public class iNaturalistSync {
         Logger.tag(TAG).debug("deleteObservations: " + count1 + ":" + count2 + ":" + count3 + ":" + count4 + ":" + count5 + ":" + count6);
 
         checkForCancelSync();
-
-        return true;
     }
 
     private void checkForCancelSync() throws CancelSyncException {
